@@ -174,25 +174,22 @@ jobs:
       # behind their official single-file portable .exe — same tool the actual
       # RustDesk releases use, not a home-grown IExpress/7-Zip substitute.
       #
-      # The compiled-in config.rs constants patched above are only a last
-      # resort fallback (and are overridden by ANY pre-existing local RustDesk
-      # config on the machine, e.g. from earlier manual testing). The
-      # mechanism that reliably self-configures on a genuinely fresh machine
-      # is CUSTOM_CLIENT_TOKEN embedded right in the exe's filename: RustDesk
-      # reads its own filename on every startup (get_license_from_exe_name()
-      # -> get_custom_server_from_string() in rustdesk/src/custom_server.rs +
-      # src/platform/windows.rs) looking for a "--<token>" segment, where
-      # <token> is a reversed, unpadded base64url encoding of the JSON
-      # {"key","host","api","relay"} — exactly what CUSTOM_CLIENT_TOKEN
-      # already is (built server-side in RustDeskConfigService/RustDeskBuildService).
-      # A plain "-<safe-name>-" segment before the "--" is only cosmetic and
-      # is tried first, fails harmlessly (not valid base64/JSON), and RustDesk
-      # falls through to the real token right after it.
+      # Deliberately a clean, plain filename here (no CUSTOM_CLIENT_TOKEN
+      # suffix) — verified live (2026-09-01) that the compiled config.rs
+      # defaults patched above are sufficient on their own: a renamed exe
+      # with zero local RustDesk config anywhere on the machine still
+      # connected correctly. The token-in-filename mechanism (still computed
+      # server-side as the CUSTOM_CLIENT_TOKEN secret, just not used here) is
+      # kept available for a separate "repair/override" distribution path —
+      # it wins over ANY local state, including a broken manual entry or a
+      # different provider's leftover config, and was confirmed live to
+      # re-fix a deliberately-misconfigured installed client. That's a
+      # distinct, occasional-use tool, not something the standard build
+      # output needs baked in by default.
       - name: Package as portable single exe
         shell: bash
         env:
           RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
-          CUSTOM_CLIENT_TOKEN: ${{ secrets.CUSTOM_CLIENT_TOKEN }}
         run: |
           sed -i '/dpiAware/d' res/manifest.xml
           pushd ./libs/portable
@@ -201,11 +198,7 @@ jobs:
           popd
           rdHost="${RENDEZVOUS_SERVER:-$DEFAULT_RENDEZVOUS_SERVER}"
           safeHost=$(echo "$rdHost" | sed -E 's/[^a-zA-Z0-9.-]/-/g')
-          if [ -z "$CUSTOM_CLIENT_TOKEN" ]; then
-            echo "::error::CUSTOM_CLIENT_TOKEN secret is empty - MSPoc-Einstellungen (ID-Server/Key) unvollstaendig?"
-            exit 1
-          fi
-          finalName="rustdesk-$safeHost--$CUSTOM_CLIENT_TOKEN.exe"
+          finalName="rustdesk-$safeHost.exe"
           mv ./target/release/rustdesk-portable-packer.exe "./$finalName"
           echo "FINAL_EXE_NAME=$finalName" >> "$GITHUB_ENV"
 
