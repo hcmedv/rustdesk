@@ -1,16 +1,6 @@
 name: Build RustDesk Windows x64 (Flutter) with custom server ID & key
 
 on:
-  push:
-    branches: [ main, master ]
-    paths:
-      - '.github/workflows/**'
-      - '**/*.rs'
-      - 'Cargo.*'
-      - 'libs/**'
-      - 'src/**'
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
 
 permissions:
@@ -138,28 +128,41 @@ jobs:
         run: |
           & "$env:VCPKG_ROOT\vcpkg" install --triplet x64-windows-static --x-install-root="$env:VCPKG_ROOT\installed"
 
-      - name: Set ID/Key/Relay from Secrets into config.rs
+      # This is a defense-in-depth fallback only. The mechanism RustDesk's
+      # Flutter client actually relies on at every startup is the filename
+      # token embedded by the "Package as portable single exe" step below
+      # (get_license_from_exe_name() in rustdesk/src/platform/windows.rs) —
+      # that's what makes a freshly downloaded/copied exe self-configure on
+      # a machine with no prior RustDesk config. These compiled-in constants
+      # are only ever consulted as a last resort, and only if the local
+      # machine has no persisted RustDesk config from an earlier run/install
+      # (verified against the real rustdesk/hbb_common source — the real
+      # names are RENDEZVOUS_SERVERS: &[&str] and RS_PUB_KEY: &str, not the
+      # DEFAULT_-prefixed names an older guide used; there is no compile-time
+      # default constant for the relay server at all).
+      - name: Set ID/Key from Secrets into hbb_common config.rs (fallback only)
         env:
           RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
           RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
-          RELAY_SERVER: ${{ secrets.RELAY_SERVER }}
         run: |
           if (-not $env:RENDEZVOUS_SERVER) { $env:RENDEZVOUS_SERVER = "$env:DEFAULT_RENDEZVOUS_SERVER" }
           if (-not $env:RS_PUB_KEY) { $env:RS_PUB_KEY = "$env:DEFAULT_RS_PUB_KEY" }
-          if (-not $env:RELAY_SERVER) { $env:RELAY_SERVER = "$env:DEFAULT_RELAY_SERVER" }
           echo "Using RENDEZVOUS_SERVER=$env:RENDEZVOUS_SERVER"
           echo "Using RS_PUB_KEY=(hidden)"
-          echo "Using RELAY_SERVER=$env:RELAY_SERVER"
-          $candidateFiles = Get-ChildItem -Recurse -File -Path libs -Filter config.rs
-          if ($candidateFiles.Count -eq 0) {
-            Write-Error "config.rs not found: repo structure changed?"; exit 1
+          $configFile = Join-Path (Get-Location) 'libs\hbb_common\src\config.rs'
+          if (-not (Test-Path $configFile)) {
+            Write-Error "hbb_common config.rs not found at $configFile - submodule checked out?"; exit 1
           }
-          foreach ($f in $candidateFiles) {
-            $content = Get-Content $f.FullName
-            $content = $content -replace '(?m)^(\s*pub\s+const\s+DEFAULT_RENDEZVOUS_SERVER\s*:\s*&str\s*=\s*)"[^"]*"', "`$1`"$env:RENDEZVOUS_SERVER`""
-            $content = $content -replace '(?m)^(\s*pub\s+const\s+DEFAULT_RS_PUB_KEY\s*:\s*&str\s*=\s*)"[^"]*"', "`$1`"$env:RS_PUB_KEY`""
-            $content = $content -replace '(?m)^(\s*pub\s+const\s+DEFAULT_RELAY_SERVER\s*:\s*&str\s*=\s*)"[^"]*"', "`$1`"$env:RELAY_SERVER`""
-            Set-Content $f.FullName -Value $content -Encoding UTF8
+          $content = Get-Content $configFile
+          $content = $content -replace '(?m)^(\s*pub\s+const\s+RENDEZVOUS_SERVERS\s*:\s*&\[&str\]\s*=\s*)&\[[^\]]*\]', "`$1&[`"$env:RENDEZVOUS_SERVER`"]"
+          $content = $content -replace '(?m)^(\s*pub\s+const\s+RS_PUB_KEY\s*:\s*&str\s*=\s*)"[^"]*"', "`$1`"$env:RS_PUB_KEY`""
+          Set-Content $configFile -Value $content -Encoding UTF8
+          $verify = Get-Content $configFile -Raw
+          if ($verify -notmatch [regex]::Escape("RENDEZVOUS_SERVERS: &[&str] = &[`"$env:RENDEZVOUS_SERVER`"]")) {
+            Write-Error "RENDEZVOUS_SERVERS patch did not take effect - const name/format in upstream config.rs may have changed again."; exit 1
+          }
+          if ($verify -notmatch [regex]::Escape("RS_PUB_KEY: &str = `"$env:RS_PUB_KEY`"")) {
+            Write-Error "RS_PUB_KEY patch did not take effect - const name/format in upstream config.rs may have changed again."; exit 1
           }
 
       - name: Build rustdesk
@@ -170,10 +173,26 @@ jobs:
       # RustDesk's own "portable packer" (libs/portable) is the real mechanism
       # behind their official single-file portable .exe — same tool the actual
       # RustDesk releases use, not a home-grown IExpress/7-Zip substitute.
+      #
+      # The compiled-in config.rs constants patched above are only a last
+      # resort fallback (and are overridden by ANY pre-existing local RustDesk
+      # config on the machine, e.g. from earlier manual testing). The
+      # mechanism that reliably self-configures on a genuinely fresh machine
+      # is CUSTOM_CLIENT_TOKEN embedded right in the exe's filename: RustDesk
+      # reads its own filename on every startup (get_license_from_exe_name()
+      # -> get_custom_server_from_string() in rustdesk/src/custom_server.rs +
+      # src/platform/windows.rs) looking for a "--<token>" segment, where
+      # <token> is a reversed, unpadded base64url encoding of the JSON
+      # {"key","host","api","relay"} — exactly what CUSTOM_CLIENT_TOKEN
+      # already is (built server-side in RustDeskConfigService/RustDeskBuildService).
+      # A plain "-<safe-name>-" segment before the "--" is only cosmetic and
+      # is tried first, fails harmlessly (not valid base64/JSON), and RustDesk
+      # falls through to the real token right after it.
       - name: Package as portable single exe
         shell: bash
         env:
           RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
+          CUSTOM_CLIENT_TOKEN: ${{ secrets.CUSTOM_CLIENT_TOKEN }}
         run: |
           sed -i '/dpiAware/d' res/manifest.xml
           pushd ./libs/portable
@@ -182,7 +201,11 @@ jobs:
           popd
           rdHost="${RENDEZVOUS_SERVER:-$DEFAULT_RENDEZVOUS_SERVER}"
           safeHost=$(echo "$rdHost" | sed -E 's/[^a-zA-Z0-9.-]/-/g')
-          finalName="rustdesk-$safeHost.exe"
+          if [ -z "$CUSTOM_CLIENT_TOKEN" ]; then
+            echo "::error::CUSTOM_CLIENT_TOKEN secret is empty - MSPoc-Einstellungen (ID-Server/Key) unvollstaendig?"
+            exit 1
+          fi
+          finalName="rustdesk-$safeHost--$CUSTOM_CLIENT_TOKEN.exe"
           mv ./target/release/rustdesk-portable-packer.exe "./$finalName"
           echo "FINAL_EXE_NAME=$finalName" >> "$GITHUB_ENV"
 
